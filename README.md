@@ -108,4 +108,4 @@ this extension is as an informational tool and NOT a definitive authority !
 would love advice, any features you'd like, and any edge cases you've found! 
 ## license
 
-MIT License
+view license tab
