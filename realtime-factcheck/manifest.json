@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
   "name": "InTruth",
-  "version": "1.1.0",
+  "version": "1.1.9",
   "description": "Real-time fact-checking of political speech and debates",
 
   "permissions": [
     "activeTab",
-    "scripting",
     "storage",
     "tabCapture",
     "offscreen"

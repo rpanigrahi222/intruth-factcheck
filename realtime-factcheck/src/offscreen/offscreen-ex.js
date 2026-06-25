@@ -12,7 +12,7 @@ let active = false;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'START_CAPTURE') {
-    startCapture(msg.streamId)
+    startCapture(msg.streamId, msg.language || 'en')
       .then(() => sendResponse({ ok: true }))
       .catch(err => {
         console.error('[offscreen] error:', err);
@@ -28,8 +28,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 let utteranceBuffer = '';
+let utteranceSpeakerCounts = {}; // track speaker word counts across buffer chunks
 
-async function startCapture(streamId) {
+async function startCapture(streamId, language = 'en') {
   if (active) stopCapture();
   active = true;
 
@@ -51,7 +52,7 @@ async function startCapture(streamId) {
       'sample_rate=16000',
       'channels=1',
       'model=nova-2',
-      'language=en-US',
+      'language=' + language,
       'punctuate=true',
       'interim_results=true',
       'utterance_end_ms=2500',
@@ -83,14 +84,31 @@ async function startCapture(streamId) {
       const text    = result.transcript.trim();
       const isFinal = data.is_final;
       const speech  = data.speech_final;
-      const speaker = result.words?.[0]?.speaker ?? null;
+
+      // accumulate speaker word counts from every chunk
+      if (result.words?.length) {
+        result.words.forEach(w => {
+          if (w.speaker !== null && w.speaker !== undefined) {
+            utteranceSpeakerCounts[w.speaker] = (utteranceSpeakerCounts[w.speaker] || 0) + 1;
+          }
+        });
+      }
+
+      // dominant speaker = whoever had the most words in this utterance so far
+      function getDominantSpeaker() {
+        const entries = Object.entries(utteranceSpeakerCounts);
+        if (!entries.length) return null;
+        return parseInt(entries.sort((a, b) => b[1] - a[1])[0][0]);
+      }
 
       if (!text) return;
 
       if (isFinal && speech) {
         // speech_final = end of utterance — send full accumulated text as final
         const fullText = utteranceBuffer ? utteranceBuffer + ' ' + text : text;
+        const speaker  = getDominantSpeaker();
         utteranceBuffer = '';
+        utteranceSpeakerCounts = {};
         chrome.runtime.sendMessage({
           type:    'TRANSCRIPT_RESULT',
           text:    fullText.trim(),
@@ -106,7 +124,7 @@ async function startCapture(streamId) {
           text:    utteranceBuffer,
           isFinal: false,
           interim: true,
-          speaker,
+          speaker: getDominantSpeaker(),
         });
       } else {
         // regular interim — show as-is
@@ -115,7 +133,7 @@ async function startCapture(streamId) {
           text,
           isFinal: false,
           interim: true,
-          speaker,
+          speaker: getDominantSpeaker(),
         });
       }
 
@@ -175,6 +193,7 @@ function startAudioPipeline() {
 function stopCapture() {
   active = false;
   utteranceBuffer = '';
+  utteranceSpeakerCounts = {};
 
   if (socket) {
     socket.close();

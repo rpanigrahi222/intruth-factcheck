@@ -64,19 +64,43 @@ function getSpeakerColor(name) {
 }
 
 // ── Speaker parsing ───────────────────────────────────────────────────────────
+const SPEAKER_PARSE_NOISE = new Set(['debate','presidential','vp','vice','2024','2023','2022','2021','2020','2019','2016','surrounded','tonight','live','full','official']);
+
 function parseSpeakersFromTitle(title) {
   if (!title) return [];
-  const roleMatch = title.match(/(\d+)\s+([a-z]+(?:\s+[a-z]+)?)\s+(?:vs?\.?|versus)\s+(\d+)\s+([a-z]+(?:\s+[a-z]+)?)/i);
+  const clean = title.split('|')[0].trim();
+
+  // 'N role vs N role' — e.g. '1 Liberal vs 20 Conservatives'
+  const roleMatch = clean.match(/(\d+)\s+([a-z]+(?:\s+[a-z]+)?)\s+(?:vs?\.?|versus)\s+(\d+)\s+([a-z]+(?:\s+[a-z]+)?)/i);
   if (roleMatch) {
     const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
     return [cap(roleMatch[2]), cap(roleMatch[4])];
   }
-  // only match capitalized proper names (not lowercase words like "in", "the", etc.)
-  const nameMatch = title.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:and|vs\.?|versus|&)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/);
-  if (nameMatch) {
-    const clean = name => name.trim().split(' ').pop();
-    return [clean(nameMatch[1]), clean(nameMatch[2])];
+
+  // 'Name vs N Description' — second side starts with digit, e.g. 'Dean Withers vs 20 MAGA Women'
+  const nameVsGroupMatch = clean.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:vs?\.?|versus)\s+(\d+)\s+(.+)/i);
+  if (nameVsGroupMatch) {
+    const name = nameVsGroupMatch[1].trim().split(' ').pop();
+    const groupWords = nameVsGroupMatch[3].trim().split(/\s+/);
+    const group = groupWords.filter(w => !SPEAKER_PARSE_NOISE.has(w.toLowerCase())).pop() || groupWords.pop();
+    return [name, group];
   }
+
+  // split on vs/and — take last non-noise capitalized word from each side
+  const vsSplit = clean.split(/\s+(?:vs?\.?|versus|and|&)\s+/i);
+  if (vsSplit.length >= 2) {
+    const lastName = part => {
+      const words = part.trim().split(/\s+/);
+      for (let i = words.length - 1; i >= 0; i--) {
+        if (/^[A-Z]/.test(words[i]) && !SPEAKER_PARSE_NOISE.has(words[i].toLowerCase())) return words[i];
+      }
+      return null;
+    };
+    const a = lastName(vsSplit[0]);
+    const b = lastName(vsSplit[1]);
+    if (a && b) return [a, b];
+  }
+
   return [];
 }
 
@@ -120,14 +144,15 @@ const confirmedSpeakerMap = {}; // { speakerId: 'Harris' }
 const pendingSpeakerIds   = new Set(); // IDs waiting for confirmation
 
 function showSpeakerBanner(speakerId, sample) {
-  if (pendingSpeakerIds.has(speakerId)) return;
-  if (speakerId in confirmedSpeakerMap) return;
+  const sid = String(speakerId);
+  if (pendingSpeakerIds.has(sid)) return;
+  if (sid in confirmedSpeakerMap) return;
   // if speakers not yet parsed from title, retry once after 1s
   if (!speakers.length) {
     setTimeout(() => showSpeakerBanner(speakerId, sample), 1000);
     return;
   }
-  pendingSpeakerIds.add(speakerId);
+  pendingSpeakerIds.add(sid);
 
   const banner = document.createElement('div');
   banner.className = 'rtfc-speaker-banner';
@@ -136,15 +161,15 @@ function showSpeakerBanner(speakerId, sample) {
     '<div class="rtfc-speaker-banner-sample">"' + escapeHtml(sample) + '..."</div>' +
     '<div class="rtfc-speaker-banner-buttons">' +
       speakers.map(name =>
-        '<button class="rtfc-speaker-banner-btn" data-name="' + escapeHtml(name) + '" data-id="' + speakerId + '">' + escapeHtml(name) + '</button>'
+        '<button class="rtfc-speaker-banner-btn" data-name="' + escapeHtml(name) + '" data-id="' + sid + '">' + escapeHtml(name) + '</button>'
       ).join('') +
-      '<button class="rtfc-speaker-banner-btn rtfc-speaker-banner-btn--skip" data-id="' + speakerId + '">Skip</button>' +
+      '<button class="rtfc-speaker-banner-btn rtfc-speaker-banner-btn--skip" data-id="' + sid + '">Skip</button>' +
     '</div>';
 
   banner.querySelectorAll('.rtfc-speaker-banner-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const name = btn.dataset.name;
-      const id   = parseInt(btn.dataset.id);
+      const id   = btn.dataset.id; // already a string — matches confirmedSpeakerMap keys
       if (name) {
         confirmedSpeakerMap[id] = name;
         chrome.runtime.sendMessage({
@@ -168,13 +193,11 @@ function showSpeakerBanner(speakerId, sample) {
 // ── Speaker confirmation state ───────────────────────────────────────────────
 
 function allSpeakersConfirmed() {
-  // true when every speaker seen so far has been confirmed or skipped
-  // and at least one real name has been confirmed
-  const confirmedNames = Object.values(confirmedSpeakerMap).filter(v => v !== null);
-  return confirmedNames.length >= Math.min(speakers.length, Object.keys(confirmedSpeakerMap).length)
-    && Object.keys(confirmedSpeakerMap).length > 0;
+  // true only when every speaker parsed from the title has been confirmed (or skipped) by the user
+  // Deepgram assigns IDs 0, 1, 2... in order of first appearance — matches speakers array indices
+  if (!speakers.length) return false;
+  return speakers.every((_, i) => String(i) in confirmedSpeakerMap);
 }
-
 function retryTagAllCards() {
   // retroactively tag all grounded cards once speakers are confirmed
   if (!verdictListEl) return;
@@ -468,21 +491,15 @@ function buildCard(result) {
 
   const lexicalRows = buildLexicalRows(result.lexical);
 
-  // speaker tag — only show on grounded cards AND only when all speakers confirmed
-  // this prevents wrong tags from appearing before diarization stabilizes
+  // speaker tag — only show when ALL speakers have been confirmed by user
+  // prevents wrong tags on cards detected before diarization stabilized
   let speakerTag = '';
-  if (!result.pending && allSpeakersConfirmed()) {
-    const confirmedName = (result.dominantSpeakerId !== null && result.dominantSpeakerId !== undefined)
-      ? confirmedSpeakerMap[result.dominantSpeakerId]
-      : undefined;
-    const rawSpeaker = (confirmedName !== undefined && confirmedName !== null)
-      ? confirmedName
-      : result.speaker || null;
-    const normalizedName = rawSpeaker ? normalizeSpeakerName(rawSpeaker) : null;
-    const speakerName  = (normalizedName && !normalizedName.match(/^Speaker\s*\d+$/i)) ? normalizedName : null;
-    const speakerColor = speakerName ? getSpeakerColor(speakerName) : null;
-    if (speakerColor) {
-      speakerTag = '<div class="rtfc-speaker-tag" style="background:' + speakerColor + '">' + escapeHtml(speakerName) + '</div>';
+  if (!result.pending && allSpeakersConfirmed() && result.dominantSpeakerId !== null && result.dominantSpeakerId !== undefined) {
+    const confirmedName = confirmedSpeakerMap[result.dominantSpeakerId];
+    if (confirmedName) {
+      const name = normalizeSpeakerName(confirmedName);
+      const color = getSpeakerColor(name);
+      speakerTag = '<div class="rtfc-speaker-tag" style="background:' + color + '">' + escapeHtml(name) + '</div>';
     }
   }
 
@@ -521,7 +538,13 @@ function buildCard(result) {
   return card;
 }
 
-function findPendingCard(claim) {
+function findPendingCard(claim, fastClaim) {
+  // try exact match on fast claim first — grounded claim text may differ from fast pass
+  if (fastClaim) {
+    const fastKey = fastClaim.toLowerCase().slice(0, 40);
+    if (pendingCards.has(fastKey)) return pendingCards.get(fastKey);
+  }
+
   const key = claim.toLowerCase().slice(0, 40);
   if (pendingCards.has(key)) return pendingCards.get(key);
 
@@ -566,6 +589,9 @@ function addVerdict(result) {
   verdictListEl.querySelector('.rtfc-empty')?.remove();
   applyVerdictToBullet(result.claim, result.verdict, result.confidence);
   if (!result._timestamp) result._timestamp = getClaimTimestamp(result.claim);
+  if (result.dominantSpeakerId !== null && result.dominantSpeakerId !== undefined) {
+    result.dominantSpeakerId = String(result.dominantSpeakerId);
+  }
   const card = buildCard(result);
   if (result.pending) {
     const key = result.claim.toLowerCase().slice(0, 40);
@@ -578,11 +604,17 @@ function addVerdict(result) {
 }
 
 function updateVerdict(result) {
-  const existing = findPendingCard(result.claim);
-  if (!result._timestamp) result._timestamp = getClaimTimestamp(result.claim);
-  // inherit dominantSpeakerId from pending card if grounded result doesn't have one
-  if (existing && existing.dataset.speakerid && !result.dominantSpeakerId) {
-    result.dominantSpeakerId = existing.dataset.speakerid;
+  const existing = findPendingCard(result.claim, result._fastClaim);
+  // always inherit timestamp from the pending card — it was set at detection time
+  // never re-derive from sentenceTimestamps which may no longer contain the original sentence
+  if (existing && existing._resultData?._timestamp) {
+    result._timestamp = existing._resultData._timestamp;
+  } else if (!result._timestamp) {
+    result._timestamp = getClaimTimestamp(result.claim);
+  }
+  // normalize dominantSpeakerId to string for consistent confirmedSpeakerMap lookup
+  if (result.dominantSpeakerId !== null && result.dominantSpeakerId !== undefined) {
+    result.dominantSpeakerId = String(result.dominantSpeakerId);
   }
   const newCard = buildCard(result);
   if (existing) {

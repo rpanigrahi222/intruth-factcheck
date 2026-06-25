@@ -5,13 +5,27 @@ const statusEl    = document.getElementById('status');
 const anthropicEl = document.getElementById('anthropicKey');
 const keyHint     = document.getElementById('keyHint');
 const keysSection = document.getElementById('keysSection');
+const languageEl  = document.getElementById('languageSelect');
+const langFlagEl  = document.getElementById('langFlag');
+
+const LANG_FLAGS = {
+  en: '🇺🇸', es: '🇪🇸', fr: '🇫🇷', de: '🇩🇪', it: '🇮🇹',
+  pt: '🇧🇷', nl: '🇳🇱', hi: '🇮🇳', ja: '🇯🇵', zh: '🇨🇳',
+  ar: '🇸🇦', ko: '🇰🇷', ru: '🇷🇺', pl: '🇵🇱', sv: '🇸🇪', tr: '🇹🇷',
+};
+
+function updateFlag() {
+  langFlagEl.textContent = LANG_FLAGS[languageEl.value] || '🌐';
+}
 
 let isActive = false;
 
-// ── Load saved key ────────────────────────────────────────────────────────────
+// ── Load saved key and language ───────────────────────────────────────────────
 
-chrome.storage.local.get(['anthropicKey'], (data) => {
+chrome.storage.local.get(['anthropicKey', 'transcriptLanguage'], (data) => {
   if (data.anthropicKey) { anthropicEl.value = data.anthropicKey; anthropicEl.classList.add('saved'); }
+  if (data.transcriptLanguage) languageEl.value = data.transcriptLanguage;
+  updateFlag();
   updateHint();
 });
 
@@ -25,6 +39,13 @@ anthropicEl.addEventListener('change', () => {
   chrome.storage.local.set({ anthropicKey: anthropicEl.value.trim() });
   anthropicEl.classList.add('saved');
   updateHint();
+});
+
+// ── Save language on change ───────────────────────────────────────────────────
+
+languageEl.addEventListener('change', () => {
+  chrome.storage.local.set({ transcriptLanguage: languageEl.value });
+  updateFlag();
 });
 
 function updateHint() {
@@ -73,8 +94,8 @@ toggleBtn.addEventListener('click', async () => {
     return;
   }
 
-  // save key then start
-  await new Promise(r => chrome.storage.local.set({ anthropicKey }, r));
+  // save key and language then start
+  await new Promise(r => chrome.storage.local.set({ anthropicKey, transcriptLanguage: languageEl.value }, r));
 
   chrome.runtime.sendMessage({ type: 'START_FACTCHECK' }, (res) => {
     if (res?.ok) {
