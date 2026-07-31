@@ -1,7 +1,8 @@
 // service-worker.js
 let ANTHROPIC_KEY = '';
 let TRANSCRIPT_LANGUAGE = 'en';
-const BACKEND_URL = '';
+const BACKEND_URL = 'https://intruth-backend.vercel.app';
+
 
 async function loadKeys() {
   return new Promise(resolve => {
@@ -14,6 +15,8 @@ async function loadKeys() {
 }
 
 const EVALUATE_PROMPT = ``
+
+
 const GROUNDED_PROMPT = ``
 
 const SPEAKER_PARSE_NOISE = new Set(['debate','presidential','vp','vice','2024','2023','2022','2021','2020','2019','2016','surrounded','tonight','live','full','official']);
@@ -184,6 +187,23 @@ async function searchWeb(query, retries = 2) {
 const MODEL_HAIKU  = 'claude-haiku-4-5-20251001';
 const MODEL_SONNET = 'claude-sonnet-5';
 
+// Cap concurrent grounded (Sonnet) calls so a pile-up of them can't saturate the
+// api.anthropic.com connection pool and starve the fast (Haiku) pass — which is
+// what makes fast cards surface late. The fast pass is never gated; grounded
+// verdicts are async refinements and can safely queue behind this gate.
+const GROUNDED_MAX_CONCURRENCY = 2;
+let groundedActive = 0;
+const groundedWaiters = [];
+function acquireGrounded() {
+  if (groundedActive < GROUNDED_MAX_CONCURRENCY) { groundedActive++; return Promise.resolve(); }
+  return new Promise(resolve => groundedWaiters.push(resolve));
+}
+function releaseGrounded() {
+  const next = groundedWaiters.shift();
+  if (next) next();          // transfer the slot directly to the next waiter
+  else groundedActive--;     // no waiter — free the slot
+}
+
 // opts: { model, maxTokens, temperature }. Defaults reproduce the fast pass
 // (Haiku, 1024 tokens, temperature 0). The grounded pass overrides these to run
 // on Sonnet — which needs a larger token budget (thinking eats into it) and
@@ -327,12 +347,19 @@ function isDuplicate(claim) {
 
 const WINDOW_SIZE = 4;
 const WINDOW_KEEP = 15;
+// Flush the window after this long even if fewer than WINDOW_SIZE sentences have
+// arrived — otherwise a claim spoken early in a window waits for 4 slow Deepgram
+// fragments (~3-4s apart = 8-12s) before the fast pass even runs. A time cap only
+// adds flushes during SLOW speech (spaced > the ~2.5s fast call), so it does not
+// reintroduce the concurrency racing that a smaller WINDOW_SIZE caused.
+const MAX_WINDOW_MS = 4000;
 
 // Each entry: { text, speakerId, speakerName }
 let sentenceWindow  = [];
 let sentenceCount   = 0;
 let windowLexical   = { rates: { hedging: 0, certainty: 0, filler: 0, emotional: 0, exclusive: 0, firstPersonSg: 0 }, wordsPerSecond: null, wordCount: 0, _sentenceCount: 0 };
 let windowStartTime = null;
+let fastPassInFlight = false;  // single-flight guard: never run two fast passes at once (they contend and balloon to 5-6s)
 let pageTitle       = '';
 let pageDate        = '';
 let currentSpeakerId  = null;
@@ -351,6 +378,7 @@ function resetWindow() {
 }
 
 async function onNewSentence(text, speakerId) {
+  console.log('[timing] sentence @', Date.now() % 100000, 'ms | spk', speakerId, '|', (text || '').slice(0, 45));  // [TIMING]
   // flush window early on speaker change (mid-window turn transition)
   if (lastSpeakerId !== null &&
       speakerId !== null &&
@@ -408,7 +436,9 @@ async function onNewSentence(text, speakerId) {
   windowLexical.wordCount += f.wordCount;
   windowLexical._sentenceCount = (windowLexical._sentenceCount || 0) + 1;
 
-  if (sentenceCount % WINDOW_SIZE === 0) {
+  // Flush when the window is full OR it has gone stale (claim waiting too long).
+  const windowStale = windowStartTime && (Date.now() - windowStartTime) > MAX_WINDOW_MS && sentenceWindow.length >= 2;
+  if (sentenceCount % WINDOW_SIZE === 0 || windowStale) {
     const contextText = sentenceWindow.map(s => s.text).join(' ');
 
     // dominant speaker ID = whoever appears most in this window
@@ -512,7 +542,13 @@ function getOpponentName(speakerName) {
 }
 
 async function evaluateClaims(contextText, title, lexicalSummary, lexicalSnapshot, dominantSpeaker, dominantSpeakerId, opponentName = null) {
+  // Single-flight: if a fast pass is already running, skip this flush — the
+  // rolling 15-sentence buffer means the next flush re-covers this content.
+  // Prevents overlapping fast calls from contending and ballooning to 5-6s.
+  if (fastPassInFlight) { console.log('[timing] fast pass busy — flush skipped'); return; }
+  fastPassInFlight = true;
   try {
+    const _tEval = Date.now();  // [TIMING]
     // resolve dismissive pronouns before Claude ever sees the text
     const resolvedText = resolveDismissivePronouns(contextText, dominantSpeaker, opponentName);
     const dateContext    = pageDate ? `\nDate: ${pageDate}` : '';
@@ -556,10 +592,12 @@ async function evaluateClaims(contextText, title, lexicalSummary, lexicalSnapsho
       : '';
 
     // fast Claude call — Serper searches fire immediately after on the returned claims
+    const _tFast = Date.now();  // [TIMING]
     const raw     = await callClaude(
       `${titleContext}Transcript: "${resolvedText}"${alreadyChecked}${lexicalContext}`,
       EVALUATE_PROMPT
     );
+    console.log('[timing] fast Claude call:', Date.now() - _tFast, 'ms');  // [TIMING]
     const results = parseArray(raw);
     const valid   = results.filter(r => r.claim && r.verdict && r.verdict !== 'UNVERIFIABLE' && !isDuplicate(r.claim));
 
@@ -580,13 +618,15 @@ async function evaluateClaims(contextText, title, lexicalSummary, lexicalSnapsho
           speaker:          dominantSpeaker || (r.speaker && !r.speaker.match(/^Speaker\s*\d+$/i) ? r.speaker : null),
         })),
       }).catch(() => {});
-      console.log('[pipeline] fast verdicts sent:', valid.length, '| speaker:', dominantSpeaker);
+      console.log('[timing] flush→card total:', Date.now() - _tEval, 'ms | fast verdicts:', valid.length, '| speaker:', dominantSpeaker);
     }
 
     groundAndUpdate(contextText, valid, title, lexicalSummary, lexicalSnapshot, dominantSpeaker, dominantSpeakerId, claimSearchPromises, opponentName);
 
   } catch (err) {
     console.error('[pipeline] error:', err);
+  } finally {
+    fastPassInFlight = false;
   }
 }
 
@@ -632,16 +672,24 @@ async function groundAndUpdate(contextText, fastResults, title, lexicalSummary, 
           parts.push(`[${idx+1}] ${r.title}${datePart}\n${r.url}\n${r.snippet}`);
         });
         const evidenceBlock = parts.join('\n\n');
-        const raw = await callClaude(
-          `${titleContext}Transcript: "${resolveDismissivePronouns(contextText, dominantSpeaker, opponentName)}"\n\nClaim: "${fastResult.claim}"\nFast verdict: ${fastResult.verdict}\n\nWeb search evidence:\n${evidenceBlock}${lexicalContext}`,
-          GROUNDED_PROMPT,
-          // Grounded pass runs on Sonnet with the re-judge prompt: independently
-          // re-evaluates instead of deferring to the fast verdict. Benchmarking
-          // showed this captures ~80% of a full-Sonnet accuracy gain while the
-          // fast pass stays on Haiku (low live latency). Sonnet needs the larger
-          // token budget and temperature omitted.
-          { model: MODEL_SONNET, maxTokens: 4096, temperature: null }
-        );
+        // Gate only the Sonnet call (Serper already resolved above) so grounded
+        // calls can't starve the fast pass for connections.
+        await acquireGrounded();
+        let raw;
+        try {
+          raw = await callClaude(
+            `${titleContext}Transcript: "${resolveDismissivePronouns(contextText, dominantSpeaker, opponentName)}"\n\nClaim: "${fastResult.claim}"\nFast verdict: ${fastResult.verdict}\n\nWeb search evidence:\n${evidenceBlock}${lexicalContext}`,
+            GROUNDED_PROMPT,
+            // Grounded pass runs on Sonnet with the re-judge prompt: independently
+            // re-evaluates instead of deferring to the fast verdict. Benchmarking
+            // showed this captures ~80% of a full-Sonnet accuracy gain while the
+            // fast pass stays on Haiku (low live latency). Sonnet needs the larger
+            // token budget and temperature omitted.
+            { model: MODEL_SONNET, maxTokens: 4096, temperature: null }
+          );
+        } finally {
+          releaseGrounded();
+        }
         const parsed = parseArray(raw);
         const match  = parsed.find(r => r.claim && r.verdict);
         // drop UNVERIFIABLE from grounded pass — either it's checkable or it isn't shown
